@@ -91,9 +91,13 @@ class StreamingA2ASendMessageTool(PythonAgentTool):
                 )
                 agent_card: AgentCard = await resolver.get_agent_card()
 
-            # Fresh client with streaming=True for the actual message send
+            # Use streaming only if the agent card advertises the capability
+            supports_streaming: bool = bool(
+                getattr(agent_card, "capabilities", None)
+                and getattr(agent_card.capabilities, "streaming", False)
+            )
             streaming_client = httpx.AsyncClient(**self._httpx_client_args)
-            config = ClientConfig(httpx_client=streaming_client, streaming=True)
+            config = ClientConfig(httpx_client=streaming_client, streaming=supports_streaming)
             factory = ClientFactory(config)
             client = factory.create(agent_card)
 

@@ -193,8 +193,12 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
     async def generate() -> AsyncGenerator[str, None]:
         # Track toolUseIds belonging to a2a_send_message calls
         # Populated from ModelMessageEvent (assistant role, toolUse blocks)
-        # Used to filter ToolStreamEvent and ToolResultMessageEvent
         a2a_tool_use_ids: set[str] = set()
+
+        # Track toolUseIds that have already had at least one ToolStreamEvent chunk
+        # yielded — used to suppress duplicate content from ToolResultMessageEvent
+        # for streaming agents while still forwarding the full result for non-streaming ones
+        a2a_streamed_ids: set[str] = set()
 
         async for event_dict in agent.stream_async(
             request.message,
@@ -211,31 +215,46 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                     ):
                         a2a_tool_use_ids.add(block["toolUse"]["toolUseId"])
 
-            # Forward streaming chunks immediately as they arrive from A2A agents
+            # Forward streaming chunks immediately as they arrive (streaming agents only)
             if event_dict.get("type") == "tool_stream":
                 tool_stream = event_dict["tool_stream_event"]
-                if tool_stream["tool_use"]["toolUseId"] in a2a_tool_use_ids:
+                tool_use_id = tool_stream["tool_use"]["toolUseId"]
+                if tool_use_id in a2a_tool_use_ids:
                     chunk = tool_stream["data"]
                     if isinstance(chunk, str) and chunk:
+                        a2a_streamed_ids.add(tool_use_id)
                         yield _sse({
                             "type": "chunk",
-                            "tool_use_id": tool_stream["tool_use"]["toolUseId"],
+                            "tool_use_id": tool_use_id,
                             "text": chunk,
                         })
 
-            # ToolResultMessageEvent — authoritative final result for compliance logging
-            # Do NOT yield to client again (content already streamed as chunks above)
+            # ToolResultMessageEvent — authoritative final result for compliance logging.
+            # For non-streaming agents (no prior chunks): yield the full content now.
+            # For streaming agents (chunks already sent): skip to avoid duplicates.
             if msg.get("role") == "user":
                 for block in msg.get("content", []):
                     if (
                         "toolResult" in block
                         and block["toolResult"]["toolUseId"] in a2a_tool_use_ids
                     ):
+                        tool_use_id = block["toolResult"]["toolUseId"]
+                        status = block["toolResult"].get("status")
                         logger.info(
-                            "tool_use_id=<%s>, status=<%s> | a2a complete result received",
-                            block["toolResult"]["toolUseId"],
-                            block["toolResult"].get("status"),
+                            "tool_use_id=<%s>, status=<%s>, streamed=<%s> | a2a complete result received",
+                            tool_use_id,
+                            status,
+                            tool_use_id in a2a_streamed_ids,
                         )
+                        if tool_use_id not in a2a_streamed_ids:
+                            # Non-streaming agent — send the full result as a single chunk
+                            for item in block["toolResult"].get("content", []):
+                                if isinstance(item.get("text"), str) and item["text"]:
+                                    yield _sse({
+                                        "type": "chunk",
+                                        "tool_use_id": tool_use_id,
+                                        "text": item["text"],
+                                    })
 
         yield _sse({"type": "done"})
 
