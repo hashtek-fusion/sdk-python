@@ -1,0 +1,136 @@
+name: 'Claude Orchestrator'
+description: 'Run the DevStudio SDK-based orchestrator to plan and implement features using Claude operator/orchestrator pattern'
+
+inputs:
+  run_id:
+    description: 'DevStudio run ID (used for status callbacks)'
+    required: true
+  project_id:
+    description: 'DevStudio project ID'
+    required: true
+  prompt:
+    description: 'Pre-generated implementation prompt from DevStudio'
+    required: true
+  target_branch:
+    description: 'Target branch to create PR against'
+    required: false
+    default: 'main'
+  repo_full_name:
+    description: 'Full repository name (owner/repo)'
+    required: true
+  aws_region:
+    description: 'AWS region for Bedrock'
+    required: false
+    default: 'us-east-1'
+  anthropic_default_sonnet_model:
+    description: 'Bedrock inference profile ID for Sonnet (e.g. us.anthropic.claude-sonnet-4-6)'
+    required: false
+    default: 'us.anthropic.claude-sonnet-4-6'
+  anthropic_default_haiku_model:
+    description: 'Bedrock inference profile ID for Haiku (e.g. us.anthropic.claude-haiku-4-5-20251001-v1:0)'
+    required: false
+    default: 'us.anthropic.claude-haiku-4-5-20251001-v1:0'
+  platform_repo:
+    description: 'DevStudio platform GitHub repository (org/repo) — used to clone orchestrator source'
+    required: false
+    default: 'hashtek-fusion/dev-studio'
+  phase:
+    description: 'Execution phase: plan | execute'
+    required: false
+    default: 'plan'
+  plan_version:
+    description: 'Plan version number (1 = initial, increments on revision cycles)'
+    required: false
+    default: '1'
+  revision_feedback:
+    description: 'Approver feedback injected into re-plan prompt'
+    required: false
+    default: ''
+  platform_token:
+    description: >
+      Token used to clone the platform repo. Defaults to the built-in GITHUB_TOKEN,
+      which works when the platform repo is public. For private platform repos set a
+      PAT (with repo read scope) as a secret and pass it here.
+    required: false
+    default: ''
+
+outputs:
+  branch_name:
+    description: 'Name of the feature branch pushed by the orchestrator (empty if no changes were made)'
+    value: ${{ steps.run-orchestrator.outputs.branch_name }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ── Install the Claude Code CLI (required by the Agent SDK at runtime) ──────
+    - name: Install Claude Code CLI
+      shell: bash
+      run: |
+        npm install -g @anthropic-ai/claude-code
+        echo "Claude CLI: $(which claude 2>/dev/null || echo 'not found in PATH')"
+
+    # ── Clone the DevStudio platform repo and build the orchestrator ────────────
+    #
+    # We build from source rather than publishing to npm so that:
+    #   - No registry or publishing step is required
+    #   - The exact commit/tag used is always traceable in the run log
+    #   - Private or public platform repos both work via an explicit token
+    #
+    # Auth strategy:
+    #   - Public repo  → no token needed; leave platform_token empty
+    #   - Private repo → create a PAT with "Contents: Read" on the platform repo,
+    #     store it as a secret (e.g. DEVSTUDIO_PLATFORM_TOKEN) and pass it via
+    #     the platform_token input in ai-orchestrator.yml
+    #
+    - name: Build DevStudio Orchestrator
+      shell: bash
+      run: |
+        echo "Cloning DevStudio platform from: ${{ inputs.platform_repo }}"
+
+        # Use explicit token when provided; fall back to unauthenticated for public repos
+        CLONE_TOKEN="${{ inputs.platform_token }}"
+        if [ -n "${CLONE_TOKEN}" ]; then
+          CLONE_URL="https://x-access-token:${CLONE_TOKEN}@github.com/${{ inputs.platform_repo }}.git"
+        else
+          CLONE_URL="https://github.com/${{ inputs.platform_repo }}.git"
+        fi
+
+        #git clone --depth=1 "${CLONE_URL}" /tmp/devstudio-platform
+        git clone --depth=1 --single-branch -b feat/direct-dynamo-event-streaming "${CLONE_URL}" /tmp/devstudio-platform
+
+        echo "Building orchestrator..."
+        cd /tmp/devstudio-platform/apps/orchestrator
+        npm ci --prefer-offline
+        npm run build
+
+        ORCHESTRATOR_BIN="/tmp/devstudio-platform/apps/orchestrator/dist/apps/orchestrator/src/main.js"
+        echo "ORCHESTRATOR_BIN=${ORCHESTRATOR_BIN}" >> "$GITHUB_ENV"
+        echo "Orchestrator built at: ${ORCHESTRATOR_BIN}"
+
+    # ── Run the orchestrator ─────────────────────────────────────────────────────
+    - name: Run DevStudio Orchestrator
+      id: run-orchestrator
+      shell: bash
+      env:
+        DEVSTUDIO_RUN_ID: ${{ inputs.run_id }}
+        DEVSTUDIO_PROJECT_ID: ${{ inputs.project_id }}
+        DEVSTUDIO_PROMPT: ${{ inputs.prompt }}
+        TARGET_BRANCH: ${{ inputs.target_branch }}
+        REPO_FULL_NAME: ${{ inputs.repo_full_name }}
+        AWS_REGION: ${{ inputs.aws_region }}
+        CLAUDE_CODE_USE_BEDROCK: "1"
+        ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ inputs.anthropic_default_sonnet_model }}
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ inputs.anthropic_default_haiku_model }}
+        DEVSTUDIO_PHASE: ${{ inputs.phase }}
+        DEVSTUDIO_PLAN_VERSION: ${{ inputs.plan_version }}
+        DEVSTUDIO_REVISION_FEEDBACK: ${{ inputs.revision_feedback }}
+        DEVSTUDIO_TABLE_NAME: ${{ 'devstudio-main' }}
+      run: |
+        # Run the orchestrator — it emits structured NDJSON to stdout
+        # GitHub Actions captures the output as job logs
+        node "${ORCHESTRATOR_BIN}" 2>&1 | tee /tmp/orchestrator.log
+
+        # Extract branch name from the final orchestrator_summary line
+        BRANCH_NAME=$(grep '"type":"orchestrator_summary"' /tmp/orchestrator.log | \
+                      python3 -c "import sys,json; data=json.loads(sys.stdin.read()); print(data.get('prBranch',''))" 2>/dev/null || echo "")
+        echo "branch_name=${BRANCH_NAME}" >> "$GITHUB_OUTPUT"
