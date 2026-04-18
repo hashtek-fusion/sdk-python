@@ -1,0 +1,270 @@
+# =============================================================================
+# DevStudio AI Orchestrator Workflow
+# =============================================================================
+#
+# Triggers:
+#   workflow_dispatch ONLY — triggered exclusively by the DevStudio platform.
+#   This workflow must NOT be triggered manually or by any other GitHub event.
+#
+# Dispatch inputs (sent by DevStudio platform):
+#   run_id        DevStudio run ID for status callbacks
+#   project_id    DevStudio project ID
+#   ticket_ref    Ticket identifier shown in branch/PR names — Jira key (e.g. PROJ-123),
+#                 'MANUAL', or any slug. Optional.
+#   prompt        Pre-generated implementation prompt from DevStudio
+#   target_branch Branch to create PR against (default: main)
+#
+# Required GitHub Secrets:
+#   AWS_BEDROCK_ROLE_ARN      IAM role ARN for Bedrock access (OIDC — no static keys needed)
+#   GH_APP_ID                 GitHub App ID (for PR creation that triggers downstream CI)
+#   GH_APP_PRIVATE_KEY        GitHub App private key
+#   DEVSTUDIO_API_URL         DevStudio API base URL (e.g. https://devstudio.yourorg.com)
+#   DEVSTUDIO_WEBHOOK_TOKEN   Secret token for DevStudio callbacks
+#
+# Optional GitHub Secrets (only needed if Jira integration is enabled):
+#   JIRA_BASE_URL             https://yourorg.atlassian.net
+#   JIRA_USER_EMAIL           Jira service account email
+#   JIRA_API_TOKEN            Jira API token
+#
+# Note: No ANTHROPIC_API_KEY is required — the orchestrator uses AWS Bedrock
+#       via the OIDC role assumed by configure-aws-credentials below.
+#
+# =============================================================================
+
+name: DevStudio AI Orchestrator
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'DevStudio run ID'
+        required: true
+      project_id:
+        description: 'DevStudio project ID'
+        required: true
+      ticket_ref:
+        description: 'Ticket reference for branch/PR naming (Jira key, MANUAL, or leave empty)'
+        required: false
+        default: ''
+      prompt:
+        description: 'Pre-generated implementation prompt from DevStudio'
+        required: true
+      target_branch:
+        description: 'Target branch for PR'
+        default: 'main'
+        required: false
+      phase:
+        description: 'Execution phase: plan (explore only) or execute (implement + review)'
+        required: false
+        default: 'plan'
+      plan_version:
+        description: 'Plan version number — 1 for initial, increments on revision cycles'
+        required: false
+        default: '1'
+      revision_feedback:
+        description: 'Approver feedback injected into re-plan prompt on revision cycles'
+        required: false
+        default: ''
+      platform_repo:
+        description: 'DevStudio platform GitHub repository (org/repo) — overrides the default baked into the composite action'
+        required: false
+        default: ''
+
+concurrency:
+  group: devstudio-${{ github.repository }}-${{ github.event.inputs.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write   # required for OIDC — allows requesting short-lived AWS credentials
+
+jobs:
+  ai-orchestrate:
+    name: AI Orchestration
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Resolve token: GitHub App (preferred) or built-in GITHUB_TOKEN (fallback)
+      #
+      # Why App token?  Commits/PRs made with GITHUB_TOKEN cannot trigger other
+      # workflows.  A GitHub App token bypasses that restriction so downstream
+      # CI fires on the generated PR automatically.
+      #
+      # If GH_APP_ID / GH_APP_PRIVATE_KEY are not configured the step is skipped
+      # and every subsequent step falls back to `github.token`.  CI may not
+      # auto-trigger on the PR in that case, but the workflow will still succeed.
+      # -----------------------------------------------------------------------
+      - name: Check GitHub App secrets
+        id: app-check
+        env:
+          GH_APP_ID: ${{ secrets.GH_APP_ID }}
+          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "${GH_APP_ID}" ] && [ -n "${GH_APP_PRIVATE_KEY}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GH_APP_ID / GH_APP_PRIVATE_KEY not configured — falling back to GITHUB_TOKEN. PRs may not trigger downstream CI automatically."
+          fi
+
+      - name: Generate GitHub App Token
+        id: app-token
+        if: steps.app-check.outputs.configured == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          # Org-scoped token — grants access to all repos the App is installed on,
+          # including the DevStudio platform repo used to clone the orchestrator source.
+          # Without this, the token is scoped to the current repo only.
+          owner: ${{ github.repository_owner }}
+
+      # -----------------------------------------------------------------------
+      # Checkout
+      # -----------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # Resolve inputs
+      # Determines branch name slug and whether this run has a real Jira ticket.
+      # -----------------------------------------------------------------------
+      - name: Resolve Inputs
+        id: inputs
+        run: |
+          TICKET="${{ github.event.inputs.ticket_ref }}"
+
+          if [ -z "$TICKET" ] || [ "$TICKET" = "MANUAL" ]; then
+            TICKET="run-${{ github.run_id }}"
+            echo "has-jira=false" >> "$GITHUB_OUTPUT"
+          else
+            # Looks like a real Jira key (e.g. PROJ-123)
+            echo "has-jira=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "run-id=${{ github.event.inputs.run_id }}" >> "$GITHUB_OUTPUT"
+          echo "project-id=${{ github.event.inputs.project_id }}" >> "$GITHUB_OUTPUT"
+          echo "ticket-ref=${TICKET}" >> "$GITHUB_OUTPUT"
+          echo "target-branch=${{ github.event.inputs.target_branch || 'main' }}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Configure AWS credentials via OIDC (no static keys needed)
+      # The orchestrator picks up AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+      # AWS_SESSION_TOKEN from the environment automatically.
+      # -----------------------------------------------------------------------
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: devstudio-${{ github.run_id }}
+
+      # -----------------------------------------------------------------------
+      # Run the DevStudio Orchestrator composite action.
+      # The composite action installs the Claude Code CLI, clones and builds
+      # the orchestrator from source (no npm publishing required), then runs it.
+      # Branch creation, commits, push, and PR creation are all handled
+      # internally — no separate steps are needed for those operations.
+      # -----------------------------------------------------------------------
+      - name: Run DevStudio Orchestrator
+        id: orchestrate
+        uses: ./.github/actions/claude-orchestrator
+        with:
+          run_id: ${{ github.event.inputs.run_id }}
+          project_id: ${{ github.event.inputs.project_id }}
+          prompt: ${{ github.event.inputs.prompt }}
+          target_branch: ${{ steps.inputs.outputs.target-branch }}
+          repo_full_name: ${{ github.repository }}
+          phase: ${{ github.event.inputs.phase || 'plan' }}
+          plan_version: ${{ github.event.inputs.plan_version || '1' }}
+          revision_feedback: ${{ github.event.inputs.revision_feedback || '' }}
+          platform_repo: ${{ github.event.inputs.platform_repo || vars.DEVSTUDIO_PLATFORM_REPO || 'your-org/devstudio-platform' }}
+          # Use the GitHub App token (org-wide access) when available.
+          # Falls back to DEVSTUDIO_PLATFORM_TOKEN PAT for cross-org or non-App setups.
+          # The built-in GITHUB_TOKEN is intentionally NOT used here — it is scoped
+          # to the single calling repo and cannot access other repos in the same org.
+          platform_token: ${{ steps.app-token.outputs.token || secrets.DEVSTUDIO_PLATFORM_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Create Pull Request
+      # Runs in the workflow (not the composite action) so GH_TOKEN is
+      # naturally available.  Uses the App token when configured so that
+      # downstream CI triggers fire on the generated PR automatically.
+      # -----------------------------------------------------------------------
+      - name: Create Pull Request
+        id: create-pr
+        if: github.event.inputs.phase == 'execute' && steps.orchestrate.outputs.branch_name != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+        run: |
+          BRANCH="${{ steps.orchestrate.outputs.branch_name }}"
+          TARGET="${{ steps.inputs.outputs.target-branch }}"
+          TICKET="${{ steps.inputs.outputs.ticket-ref }}"
+          RUN_ID="${{ github.event.inputs.run_id }}"
+
+          # Create ai-generated label (non-blocking)
+          gh label create "ai-generated" --description "AI-generated code" --color "6E40C9" --force 2>/dev/null || true
+
+          PR_URL=$(gh pr create \
+            --title "DevStudio: ${TICKET}" \
+            --body "$(printf '## AI-Orchestrated Implementation\n\n**DevStudio Run:** `%s`\n**Ticket:** %s\n\nThis PR was generated by the DevStudio Orchestrator using the Claude SDK operator/orchestrator pattern.\n\n### Review Checklist\n- [ ] Code follows project conventions\n- [ ] Tests pass and cover acceptance criteria\n- [ ] No security issues' "${RUN_ID}" "${TICKET}")" \
+            --head "${BRANCH}" \
+            --base "${TARGET}" \
+            --label "ai-generated")
+
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+          echo "PR created: ${PR_URL}"
+
+      # -----------------------------------------------------------------------
+      # Update Jira status to In Review (only when a real Jira ticket exists
+      # and the orchestrator produced a PR)
+      # -----------------------------------------------------------------------
+      - name: Update Jira Status
+        if: github.event.inputs.phase == 'execute' && steps.create-pr.outputs.pr_url != '' && steps.inputs.outputs.has-jira == 'true'
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          JIRA_KEY="${{ steps.inputs.outputs.ticket-ref }}"
+          # Abort gracefully if Jira secrets are not configured
+          if [ -z "${JIRA_BASE_URL}" ] || [ -z "${JIRA_API_TOKEN}" ]; then
+            echo "Jira secrets not configured — skipping status update"
+            exit 0
+          fi
+          CREDS=$(echo -n "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" | base64)
+          TRANSITIONS=$(curl -sf -H "Authorization: Basic ${CREDS}" \
+            "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_KEY}/transitions" || echo "{}")
+          IN_REVIEW_ID=$(echo "$TRANSITIONS" | python3 -c "
+          import sys,json
+          ts = json.load(sys.stdin).get('transitions',[])
+          for t in ts:
+              if t['name'].lower() in ['in review','code review','review']:
+                  print(t['id']); break
+          " 2>/dev/null || echo "")
+          if [ -n "$IN_REVIEW_ID" ]; then
+            curl -sf -X POST \
+              -H "Authorization: Basic ${CREDS}" \
+              -H "Content-Type: application/json" \
+              -d "{\"transition\":{\"id\":\"${IN_REVIEW_ID}\"}}" \
+              "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_KEY}/transitions"
+            echo "Jira status updated to In Review"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Upload orchestrator log as artifact for debugging
+      # -----------------------------------------------------------------------
+      - name: Upload Orchestrator Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestrator-log-${{ github.run_id }}
+          path: /tmp/orchestrator.log
+          retention-days: 7
